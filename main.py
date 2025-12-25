@@ -1,0 +1,237 @@
+"""
+main.py
+Run an OFDM simulation with selectable modulation + coding rate.
+Generates:
+- baseline OFDM waveform
+- PAPR CCDF
+- clipping+filtering PAPR improvement
+- HPA (Rapp) nonlinearity effect
+- EVM + PSD plots
+
+Run:
+  python main.py
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from src import params
+from src.coding import encode_with_rate, ndbps_per_symbol
+from src.interleaver import interleave_symbol
+from src.mapping import bits_to_symbols, NBPSC
+from src.ofdm import ofdm_modulate_frame, ofdm_demodulate_frame
+from src.papr import papr_per_symbol, ccdf, clip_and_filter_symbol
+from src.hpa import RappHPA, set_average_power, evm_rms, cpe_correct
+from src.utils import plot_ccdf, plot_psd
+
+
+def _prompt_choice(prompt: str, options: list[str]) -> str:
+    while True:
+        print(prompt)
+        for i, opt in enumerate(options, start=1):
+            print(f"  {i}) {opt}")
+        s = input("Enter number: ").strip()
+        if s.isdigit():
+            idx = int(s)
+            if 1 <= idx <= len(options):
+                return options[idx - 1]
+        print("Invalid choice, try again.\n")
+
+
+def mp3_to_bits(path: str) -> np.ndarray:
+    """
+    Read an MP3 file, extract raw PCM samples, and convert to a bitstream (uint8 0/1).
+    Requires: pydub + ffmpeg
+    """
+    from pydub import AudioSegment
+
+    audio = AudioSegment.from_file(path)
+    # Convert to mono to simplify (optional)
+    audio = audio.set_channels(1)
+
+    # Get raw PCM bytes (little-endian)
+    raw = audio.raw_data  # bytes
+
+    # Convert bytes -> bits (big-endian bit order inside each byte)
+    b = np.frombuffer(raw, dtype=np.uint8)
+    bits = np.unpackbits(b, bitorder="big").astype(np.uint8)
+    return bits
+
+
+def build_tx_chain(
+    modulation: str,
+    rate: str,
+    num_symbols: int,
+    seed: int = 1,
+    info_bits_in: np.ndarray | None = None,
+):
+    """
+    Returns:
+      tx_bits_info: information bits (length num_symbols*NDBPS)
+      tx_data_symbols: (num_symbols, 48) complex data symbols
+      tx_wave: time-domain waveform with CP (optionally oversampled)
+    """
+    nbpsc = NBPSC[modulation]
+    ncbps = 48 * nbpsc
+    ndbps = ndbps_per_symbol(nbpsc, rate)
+
+    if info_bits_in is None:
+        rng = np.random.default_rng(seed)
+        info_bits = rng.integers(0, 2, size=num_symbols * ndbps, dtype=np.uint8)
+    else:
+        info_bits_in = np.asarray(info_bits_in, dtype=np.uint8).reshape(-1)
+        need_info = num_symbols * ndbps
+        if info_bits_in.size < need_info:
+            # pad zeros if audio bits shorter than needed
+            info_bits = np.concatenate(
+                [info_bits_in, np.zeros(need_info - info_bits_in.size, dtype=np.uint8)]
+            )
+        else:
+            # truncate if longer than needed
+            info_bits = info_bits_in[:need_info]
+
+    # Encode whole frame, then split into OFDM symbol blocks of NCBPS (after puncturing)
+    coded = encode_with_rate(info_bits, rate=rate, add_tail=False)
+
+    # Ensure length matches exactly num_symbols * NCBPS (pad with zeros if needed)
+    need = num_symbols * ncbps
+    if coded.size < need:
+        coded = np.concatenate([coded, np.zeros(need - coded.size, dtype=np.uint8)])
+    coded = coded[:need]
+
+    # Interleave symbol-by-symbol
+    inter = np.zeros_like(coded)
+    for n in range(num_symbols):
+        block = coded[n * ncbps : (n + 1) * ncbps]
+        inter[n * ncbps : (n + 1) * ncbps] = interleave_symbol(block, nbpsc=nbpsc)
+
+    # Map to constellation symbols: NCBPS bits per symbol => 48 symbols
+    data_symbols = np.zeros((num_symbols, 48), dtype=np.complex128)
+    for n in range(num_symbols):
+        b = inter[n * ncbps : (n + 1) * ncbps]
+        data_symbols[n] = bits_to_symbols(b, modulation=modulation)
+
+    return info_bits, data_symbols
+
+
+def main():
+    modulation = _prompt_choice(
+        "Select modulation:", ["BPSK", "QPSK", "16QAM", "64QAM"]
+    )
+    rate = _prompt_choice("Select coding rate:", ["1/2", "2/3", "3/4"])
+    num_symbols = int(input("Number of OFDM data symbols (e.g., 50): ").strip() or "50")
+    os_factor = int(
+        input("Oversampling factor for PAPR/PSD (1,2,4) [default 4]: ").strip() or "4"
+    )
+    clipping_ratio = float(
+        input("Clipping ratio (A/RMS) [default 1.2]: ").strip() or "1.2"
+    )
+    clip_iters = int(input("Clip+filter iterations [default 2]: ").strip() or "2")
+    ibo_db = float(input("HPA Input Backoff (dB) [default 6]: ").strip() or "6")
+    rapp_p = float(input("Rapp smoothness p [default 2]: ").strip() or "2")
+
+    use_audio = (
+        input("Use MP3 file as input bits? (y/n) [default n]: ").strip().lower() == "y"
+    )
+    audio_bits = None
+    if use_audio:
+        path = input("Enter path to MP3 (e.g., test.mp3): ").strip()
+        audio_bits = mp3_to_bits(path)
+
+    # --- TX chain
+    info_bits, data_syms = build_tx_chain(
+        modulation, rate, num_symbols, seed=2, info_bits_in=audio_bits
+    )
+
+    # OFDM modulation (with CP)
+    tx_wave = ofdm_modulate_frame(
+        data_syms, os_factor=os_factor, add_cyclic_prefix=True
+    )
+    tx_wave = set_average_power(tx_wave, 1.0)
+
+    # --- PAPR baseline
+    paprs = papr_per_symbol(tx_wave, os_factor=os_factor, has_cp=True)
+    thr = np.linspace(0, 15, 301)
+    cc = ccdf(paprs, thr)
+    plot_ccdf(thr, cc, title=f"PAPR CCDF (baseline) - {modulation} {rate}")
+
+    # --- Clipping + filtering per symbol (work on useful part, then re-add CP)
+    N = params.N_FFT * os_factor
+    cp = params.N_CP * os_factor
+    sym_len = N + cp
+    tx_cf = np.zeros_like(tx_wave)
+    for n in range(num_symbols):
+        seg = tx_wave[n * sym_len : (n + 1) * sym_len]
+        x = seg[cp:]  # useful part
+        y = clip_and_filter_symbol(
+            x, os_factor=os_factor, clipping_ratio=clipping_ratio, iters=clip_iters
+        )
+        tx_cf[n * sym_len : (n + 1) * sym_len] = np.concatenate([y[-cp:], y])
+    tx_cf = set_average_power(tx_cf, 1.0)
+
+    paprs_cf = papr_per_symbol(tx_cf, os_factor=os_factor, has_cp=True)
+    cc_cf = ccdf(paprs_cf, thr)
+    plot_ccdf(
+        thr,
+        cc_cf,
+        title=f"PAPR CCDF (clip+filter) CR={clipping_ratio}, iters={clip_iters}",
+    )
+
+    # --- HPA model (Rapp) with input backoff
+    # Set IBO by scaling input so that average power is 1/10^(IBO/10) relative to saturation
+    # Choose A_sat=1 and scale input power accordingly.
+    A_sat = 1.0
+    hpa = RappHPA(A_sat=A_sat, p=rapp_p)
+    # Input scaling for IBO: P_in = A_sat^2 / 10^(IBO/10)  (rough rule-of-thumb)
+    target_pin = (A_sat**2) / (10 ** (ibo_db / 10))
+    tx_wave_ibo = set_average_power(tx_wave, target_pin)
+    tx_cf_ibo = set_average_power(tx_cf, target_pin)
+
+    y_base = hpa(tx_wave_ibo)
+    y_cf = hpa(tx_cf_ibo)
+
+    # PSD plots
+    fs = 20e6 * os_factor  # nominal
+    plot_psd(y_base, fs_hz=fs, title=f"PSD after HPA (baseline) IBO={ibo_db} dB")
+    plot_psd(y_cf, fs_hz=fs, title=f"PSD after HPA (clip+filter) IBO={ibo_db} dB")
+
+    # --- EVM (compare received data subcarriers to transmitted reference)
+    # Demod baseline and clip+filter outputs after HPA
+    _, data_hat_base, _ = ofdm_demodulate_frame(
+        y_base, num_symbols=num_symbols, os_factor=os_factor, has_cp=True
+    )
+    _, data_hat_cf, _ = ofdm_demodulate_frame(
+        y_cf, num_symbols=num_symbols, os_factor=os_factor, has_cp=True
+    )
+
+    ref = data_syms.reshape(-1)
+    est_base = data_hat_base.reshape(-1)
+    est_cf = data_hat_cf.reshape(-1)
+
+    # Optional common phase correction to avoid counting CPE as EVM
+    est_base_c = cpe_correct(ref, est_base)
+    est_cf_c = cpe_correct(ref, est_cf)
+
+    evm_base = evm_rms(ref, est_base_c)
+    evm_cf = evm_rms(ref, est_cf_c)
+
+    print("\n--- Results ---")
+    print(
+        f"Modulation: {modulation}, Rate: {rate}, Symbols: {num_symbols}, OS: {os_factor}x"
+    )
+    print(
+        f"Mean PAPR baseline: {paprs.mean():.2f} dB, 99.9%: {np.quantile(paprs, 0.999):.2f} dB"
+    )
+    print(
+        f"Mean PAPR clip+filter: {paprs_cf.mean():.2f} dB, 99.9%: {np.quantile(paprs_cf, 0.999):.2f} dB"
+    )
+    print(f"EVM after HPA (baseline, CPE-corrected): {evm_base*100:.2f}%")
+    print(f"EVM after HPA (clip+filter, CPE-corrected): {evm_cf*100:.2f}%")
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
