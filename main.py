@@ -32,6 +32,7 @@ from src.coding import ndbps_per_symbol
 from src.mapping import NBPSC
 from src.hpa import RappHPA
 from src.transmitter import TxConfig, build_tx_waveforms
+from src.channel import FIRChannel, DEFAULT_H
 from src.receiver import rx_constellation_and_evm, rx_recover_bits
 
 from src.utils import (
@@ -259,11 +260,16 @@ def main():
         y_base, fs=fs, title=f"Spectrogram after HPA (baseline) - IBO={ibo_db:.1f} dB"
     )
 
+    # ---------------- Time-invariant complex FIR filter wireless channel ----------------
+    chan = FIRChannel(h=DEFAULT_H, normalize=True)
+    r_base = chan(y_base)
+    r_cf = chan(y_cf) if cf_enabled else None
+
     # ---------------- Receiver: EVM + constellation ----------------
     ref_syms = data_syms.reshape(-1)
 
     est_base_c, evm_base, data_hat_base = rx_constellation_and_evm(
-        y_base,
+        r_base,
         ref_data_symbols=ref_syms,
         num_symbols=num_symbols,
         os_factor=os_factor,
@@ -272,7 +278,7 @@ def main():
     est_cf_c = evm_cf = data_hat_cf = None
     if cf_enabled:
         est_cf_c, evm_cf, data_hat_cf = rx_constellation_and_evm(
-            y_cf,
+            r_cf,
             ref_data_symbols=data_syms.reshape(-1),
             num_symbols=num_symbols,
             os_factor=os_factor,
@@ -316,7 +322,7 @@ def main():
         rec_base = bits_to_bytes(rb)[:orig_byte_len]
         out_base = results_dir / f"{tag}_recovered_baseline.mp3"
         out_base.write_bytes(rec_base)
-        
+
         print(f"Saved recovered MP3 (baseline): {out_base}")
         if cf_enabled:
             rc = rx_bits_cf[:orig_bit_len]
