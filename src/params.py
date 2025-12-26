@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import numpy as np
 
+FS = 20e6
+
 # ----------------------------
 # OFDM core parameters (802.11a)
 # ----------------------------

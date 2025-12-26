@@ -1,312 +1,331 @@
 """
 main.py
-Run an OFDM simulation with selectable modulation + coding rate.
-Generates:
-- baseline OFDM waveform
-- PAPR CCDF
-- clipping+filtering PAPR improvement
-- HPA (Rapp) nonlinearity effect
-- EVM + PSD plots
-- Spectrogram + constellation (TX and after HPA)
+End-to-end OFDM TX/RX simulation:
+- Source bits (random or MP3 bytes->bits)
+- FEC encode + puncture (rate 1/2, 2/3, 3/4)
+- Interleave per OFDM symbol (802.11a style)
+- Constellation mapping (BPSK/QPSK/16QAM/64QAM)
+- OFDM modulation (64-pt IFFT, CP, optional oversampling)
+- (Optional) clip+filter PAPR reduction
+- Average power normalization
+- HPA (Rapp AM/AM) with specified IBO
+- Receiver: OFDM demod + EVM/constellation
+- (Optional) full bit recovery: demap -> deinterleave -> Viterbi decode -> BER
+- Save plots and (if MP3 input) save recovered MP3
 
-Run:
-  python main.py
+This file assumes you already created:
+- transmitter.py (build_tx_waveforms)
+- receiver.py (rx_constellation_and_evm, rx_recover_bits)
+- rf.py (optional IQ mod/demod; not enabled by default here)
+- hpa.py (RappHPA)
+- utils.py (plot_* helpers, set_average_power, bits_to_bytes, etc.)
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
-from pathlib import Path
-from scipy.signal import spectrogram
 
 from src import params
-from src.coding import encode_with_rate, ndbps_per_symbol
-from src.interleaver import interleave_symbol
-from src.mapping import bits_to_symbols, NBPSC
-from src.ofdm import ofdm_modulate_frame, ofdm_demodulate_frame
-from src.papr import papr_per_symbol, ccdf, clip_and_filter_symbol
-from src.hpa import (
-    RappHPA,
+from src.coding import ndbps_per_symbol
+from src.mapping import NBPSC
+from src.hpa import RappHPA
+from src.transmitter import TxConfig, build_tx_waveforms
+from src.receiver import rx_constellation_and_evm, rx_recover_bits
+
+from src.utils import (
     set_average_power,
-    evm_rms,
-    cpe_correct,
-    complex_gain_correct,
+    bits_to_bytes,
+    plot_constellation,
+    plot_spectrogram,
+    plot_psd,
+    plot_papr_ccdf,
 )
-from src.utils import plot_ccdf, plot_psd
+
+# Optional RF chain (not enabled by default)
+from src.rf import iq_modulate, iq_demodulate
 
 
-def _prompt_choice(prompt: str, options: list[str]) -> str:
+def _ask_choice(prompt: str, options: list[str]) -> str:
+    print(prompt)
+    for i, opt in enumerate(options, start=1):
+        print(f"  {i}) {opt}")
     while True:
-        print(prompt)
-        for i, opt in enumerate(options, start=1):
-            print(f"  {i}) {opt}")
-        s = input("Enter number: ").strip()
-        if s.isdigit():
-            idx = int(s)
-            if 1 <= idx <= len(options):
-                return options[idx - 1]
-        print("Invalid choice, try again.\n")
+        try:
+            x = int(input("Enter number: ").strip())
+            if 1 <= x <= len(options):
+                return options[x - 1]
+        except Exception:
+            pass
+        print("Invalid choice, try again.")
 
 
-def mp3_to_bits(path: str) -> np.ndarray:
-    """
-    Read an MP3 file, extract raw PCM samples, and convert to a bitstream (uint8 0/1).
-    Requires: pydub + ffmpeg
-    """
-    try:
-        from pydub import AudioSegment
-    except ImportError as e:
-        raise ImportError(
-            "Missing dependency: pydub. Install with: pip install pydub"
-        ) from e
-
-    audio = AudioSegment.from_file(path)
-    audio = audio.set_channels(1)  # mono
-    raw = audio.raw_data  # bytes (PCM)
-    b = np.frombuffer(raw, dtype=np.uint8)
-    bits = np.unpackbits(b, bitorder="big").astype(np.uint8)
-    return bits
+def _ask_int(prompt: str, default: int) -> int:
+    s = input(f"{prompt} [default {default}]: ").strip()
+    if s == "":
+        return default
+    return int(s)
 
 
-def build_tx_chain(
+def _ask_float(prompt: str, default: float) -> float:
+    s = input(f"{prompt} [default {default}]: ").strip()
+    if s == "":
+        return default
+    return float(s)
+
+
+def _ask_yesno(prompt: str, default: bool = False) -> bool:
+    d = "y" if default else "n"
+    s = input(f"{prompt} (y/n) [default {d}]: ").strip().lower()
+    if s == "":
+        return default
+    return s.startswith("y")
+
+
+def _bytes_to_bits(b: bytes) -> np.ndarray:
+    arr = np.frombuffer(b, dtype=np.uint8)
+    bits = np.unpackbits(arr, bitorder="big")
+    return bits.astype(np.uint8)
+
+def _prepare_source_bits(
     modulation: str,
     rate: str,
     num_symbols: int,
-    seed: int = 1,
-    info_bits_in: np.ndarray | None = None,
+    use_mp3: bool,
+    mp3_path: str | None,
 ):
     """
-    Builds the TX symbol stream (data subcarriers only).
-
     Returns:
-      info_bits: (num_symbols*NDBPS) information bits (uint8)
-      data_symbols: (num_symbols, 48) complex mapped data symbols
+      tx_bits: information bits padded to num_symbols_used*NDBPS
+      raw_bytes: MP3 bytes (or None)
+      orig_byte_len: original byte length (or 0)
+      orig_bit_len: original bit length (or 0)
+      num_symbols_used: possibly increased symbol count to fit the file
     """
     nbpsc = NBPSC[modulation]
-    ncbps = 48 * nbpsc
     ndbps = ndbps_per_symbol(nbpsc, rate)
 
-    # ----- Input bits -----
-    if info_bits_in is None:
-        rng = np.random.default_rng(seed)
-        info_bits = rng.integers(0, 2, size=num_symbols * ndbps, dtype=np.uint8)
-    else:
-        info_bits_in = np.asarray(info_bits_in, dtype=np.uint8).reshape(-1)
-        need_info = num_symbols * ndbps
-        if info_bits_in.size < need_info:
-            info_bits = np.concatenate(
-                [info_bits_in, np.zeros(need_info - info_bits_in.size, dtype=np.uint8)]
-            )
-        else:
-            info_bits = info_bits_in[:need_info]
+    if use_mp3:
+        if mp3_path is None:
+            raise ValueError("mp3_path required if use_mp3=True")
 
-    # ----- FEC: mother rate-1/2 then puncture to selected rate -----
-    coded = encode_with_rate(info_bits, rate=rate, add_tail=False)
+        raw = Path(mp3_path).read_bytes()
+        orig_byte_len = len(raw)
+        orig_bits = _bytes_to_bits(raw)
+        orig_bit_len = orig_bits.size
 
-    # Ensure we have exactly num_symbols * NCBPS coded bits
-    need = num_symbols * ncbps
-    if coded.size < need:
-        coded = np.concatenate([coded, np.zeros(need - coded.size, dtype=np.uint8)])
-    coded = coded[:need]
+        # compute how many symbols are needed to carry the whole file (no truncation)
+        num_symbols_needed = int(np.ceil(orig_bit_len / ndbps))
+        num_symbols_used = max(num_symbols, num_symbols_needed)
 
-    # ----- Interleave per OFDM symbol -----
-    inter = np.zeros_like(coded)
-    for n in range(num_symbols):
-        block = coded[n * ncbps : (n + 1) * ncbps]
-        inter[n * ncbps : (n + 1) * ncbps] = interleave_symbol(block, nbpsc=nbpsc)
+        n_info = num_symbols_used * ndbps
+        tx_bits = np.concatenate(
+            [orig_bits, np.zeros(n_info - orig_bit_len, dtype=np.uint8)]
+        )
 
-    # ----- Map bits to constellation symbols -----
-    data_symbols = np.zeros((num_symbols, 48), dtype=np.complex128)
-    for n in range(num_symbols):
-        b = inter[n * ncbps : (n + 1) * ncbps]
-        data_symbols[n] = bits_to_symbols(b, modulation=modulation)
+        return (
+            tx_bits.astype(np.uint8),
+            raw,
+            orig_byte_len,
+            orig_bit_len,
+            num_symbols_used,
+        )
 
-    return info_bits, data_symbols
-
-
-def plot_constellation(sym: np.ndarray, title: str):
-    sym = np.asarray(sym, dtype=np.complex128).reshape(-1)
-    plt.figure()
-    plt.scatter(sym.real, sym.imag, s=6, alpha=0.35)
-    plt.grid(True)
-    plt.axis("equal")
-    plt.title(title)
-    plt.xlabel("I")
-    plt.ylabel("Q")
-
-
-def plot_spectrogram(x: np.ndarray, fs: float, title: str):
-    """
-    Spectrogram for complex baseband:
-    uses return_onesided=False and shifts frequency axis.
-    """
-    x = np.asarray(x, dtype=np.complex128).reshape(-1)
-
-    f, t, Sxx = spectrogram(
-        x,
-        fs=fs,
-        nperseg=2048,
-        noverlap=1536,
-        return_onesided=False,
-        scaling="density",
-        mode="psd",
-    )
-    f = np.fft.fftshift(f)
-    Sxx = np.fft.fftshift(Sxx, axes=0)
-
-    plt.figure()
-    plt.pcolormesh(t * 1e3, f / 1e6, 10 * np.log10(Sxx + 1e-20), shading="auto")
-    plt.title(title)
-    plt.xlabel("Time (ms)")
-    plt.ylabel("Frequency (MHz)")
-    plt.colorbar(label="PSD (dB/Hz)")
-
+    # random bits
+    num_symbols_used = num_symbols
+    n_info = num_symbols_used * ndbps
+    tx_bits = np.random.randint(0, 2, size=n_info, dtype=np.uint8)
+    return tx_bits, None, 0, 0, num_symbols_used
 
 def main():
-    modulation = _prompt_choice(
-        "Select modulation:", ["BPSK", "QPSK", "16QAM", "64QAM"]
-    )
-    rate = _prompt_choice("Select coding rate:", ["1/2", "2/3", "3/4"])
+    # ---------------- User inputs ----------------
+    modulation = _ask_choice("Select modulation:", ["BPSK", "QPSK", "16QAM", "64QAM"])
+    rate = _ask_choice("Select coding rate:", ["1/2", "2/3", "3/4"])
 
-    num_symbols = int(input("Number of OFDM data symbols (e.g., 50): ").strip() or "50")
-    os_factor = int(
-        input("Oversampling factor for PAPR/PSD (1,2,4) [default 4]: ").strip() or "4"
-    )
-    clipping_ratio = float(
-        input("Clipping ratio (A/RMS) [default 1.2]: ").strip() or "1.2"
-    )
-    clip_iters = int(input("Clip+filter iterations [default 2]: ").strip() or "2")
-    ibo_db = float(input("HPA Input Backoff (dB) [default 6]: ").strip() or "6")
-    rapp_p = float(input("Rapp smoothness p [default 2]: ").strip() or "2")
+    num_symbols = _ask_int("Number of OFDM data symbols (e.g., 50)", 200)
+    os_factor = _ask_int("Oversampling factor for PAPR/PSD (1,2,4)", 4)
 
-    use_audio = (
-        input("Use MP3 file as input bits? (y/n) [default n]: ").strip().lower() == "y"
-    )
-    audio_bits = None
-    if use_audio:
-        path = input("Enter path to MP3 (e.g., test.mp3): ").strip()
-        audio_bits = mp3_to_bits(path)
+    clip_ratio = _ask_float("Clipping ratio (A/RMS)", 1.2)
+    clip_iters = _ask_int("Clip+filter iterations", 2)
 
-    # Results folder + filename tag
-    results_dir = Path(__file__).resolve().parent / "results"
-    results_dir.mkdir(exist_ok=True)
+    ibo_db = _ask_float("HPA Input Backoff (dB)", 6.0)
+    rapp_p = _ask_float("Rapp smoothness p", 2.0)
+
+    use_mp3 = _ask_yesno("Use MP3 file as input bits?", default=False)
+    mp3_path = None
+    if use_mp3:
+        mp3_path = input("Enter path to MP3 (e.g., test.mp3): ").strip()
+        if mp3_path == "":
+            mp3_path = "test.mp3"
+
+    # Results directory
+    results_dir = Path("results")
+    results_dir.mkdir(parents=True, exist_ok=True)
+
     tag = f"{modulation}_{rate.replace('/','-')}_N{num_symbols}_OS{os_factor}"
 
-    # ----- TX chain -----
-    info_bits, data_syms = build_tx_chain(
-        modulation, rate, num_symbols, seed=2, info_bits_in=audio_bits
+    # Sampling rate for plotting (baseband). Prefer params.FS if you defined it.
+    fs_base = getattr(params.FS, "FS", 20e6)
+    fs = fs_base * os_factor
+
+    # ---------------- Source bits ----------------
+    tx_bits, src_bytes, orig_byte_len, orig_bit_len, num_symbols_used = _prepare_source_bits(
+        modulation=modulation,
+        rate=rate,
+        num_symbols=num_symbols,
+        use_mp3=use_mp3,
+        mp3_path=mp3_path,
     )
 
-    # TX constellation (mapped data)
-    plot_constellation(
-        data_syms, title=f"TX constellation (mapped data) - {modulation} {rate}"
+    # IMPORTANT: use the updated symbol count downstream
+    if num_symbols_used != num_symbols:
+        print(f"Auto-updated num_symbols from {num_symbols} -> {num_symbols_used} to fit the MP3 bitstream.")
+    num_symbols = num_symbols_used
+
+    # ---------------- Transmitter ----------------
+    cfg = TxConfig(
+        modulation=modulation,
+        rate=rate,
+        num_symbols=num_symbols,
+        os_factor=os_factor,
+        seed=2,
+        add_cp=True,
+        target_avg_power=1.0,
+        clip_ratio=clip_ratio,
+        clip_iters=clip_iters,  
     )
 
-    # ----- OFDM modulation -----
-    tx_wave = ofdm_modulate_frame(
-        data_syms, os_factor=os_factor, add_cyclic_prefix=True
-    )
+    tx = build_tx_waveforms(cfg, info_bits_in=tx_bits)  
+    tx_wave = tx["tx_wave"]
+    tx_cf = tx["tx_cf"]
+    data_syms = tx["data_symbols"]
+
+    cf_enabled = (clip_iters > 0) and (tx_cf is not None)
+
+    # Important normalization: define a consistent reference power level
     tx_wave = set_average_power(tx_wave, 1.0)
+    if cf_enabled:
+        tx_cf = set_average_power(tx_cf, 1.0)
 
-    # Sample rate used for plots
-    fs = 20e6 * os_factor
-
-    # Spectrogram (TX waveform)
+    # Plots before HPA
     plot_spectrogram(tx_wave, fs=fs, title=f"Spectrogram (TX waveform) - {tag}")
 
-    # ----- Clipping + filtering -----
-    N = params.N_FFT * os_factor
-    cp = params.N_CP * os_factor
-    sym_len = N + cp
-
-    tx_cf = np.zeros_like(tx_wave)
-    for n in range(num_symbols):
-        seg = tx_wave[n * sym_len : (n + 1) * sym_len]
-        x = seg[cp:]  # useful part only
-        y = clip_and_filter_symbol(
-            x, os_factor=os_factor, clipping_ratio=clipping_ratio, iters=clip_iters
-        )
-        tx_cf[n * sym_len : (n + 1) * sym_len] = np.concatenate([y[-cp:], y])
-
-    tx_cf = set_average_power(tx_cf, 1.0)
-
-    # ----- PAPR -----
-    paprs = papr_per_symbol(tx_wave, os_factor=os_factor, has_cp=True)
-    paprs_cf = papr_per_symbol(tx_cf, os_factor=os_factor, has_cp=True)
-
-    thr_max = max(paprs.max(), paprs_cf.max()) + 1.0
-    thr = np.linspace(0, thr_max, 400)
-
-    cc = ccdf(paprs, thr)
-    cc_cf = ccdf(paprs_cf, thr)
-
-    plot_ccdf(thr, cc, title=f"PAPR CCDF (baseline) - {modulation} {rate}")
-    plot_ccdf(
-        thr,
-        cc_cf,
-        title=f"PAPR CCDF (clip+filter) CR={clipping_ratio}, iters={clip_iters}",
+    # Always plot baseline CCDF
+    plot_papr_ccdf(
+        wave_baseline=tx_wave,
+        wave_cf=None,  # baseline only here
+        os_factor=os_factor,
+        has_cp=True,
+        title=f"PAPR CCDF (baseline) - {modulation} {rate}",
     )
 
-    # ----- HPA model (Rapp) with input backoff -----
+    # Plot clip+filter only if enabled and waveform exists
+    if tx_cf is not None and clip_iters > 0:
+        plot_papr_ccdf(
+            wave_baseline=tx_wave,
+            wave_cf=tx_cf,
+            os_factor=os_factor,
+            has_cp=True,
+            title=f"PAPR CCDF (baseline vs clip+filter) CR={clip_ratio}, iters={clip_iters}",
+            label_baseline="baseline",
+            label_cf="clip+filter",
+        )
+    else:
+        print("Clip+filter disabled -> skipping clip+filter CCDF plot.")
+
+    # ---------------- HPA (Power Amplifier) ----------------
     A_sat = 1.0
     hpa = RappHPA(A_sat=A_sat, p=rapp_p)
 
+    # Set input average power to meet IBO:
+    # IBO(dB) = 10*log10( A_sat^2 / Pin_avg )
     target_pin = (A_sat**2) / (10 ** (ibo_db / 10))
+
     tx_wave_ibo = set_average_power(tx_wave, target_pin)
-    tx_cf_ibo = set_average_power(tx_cf, target_pin)
-
     y_base = hpa(tx_wave_ibo)
-    y_cf = hpa(tx_cf_ibo)
 
-    # PSD plots
-    plot_psd(y_base, fs_hz=fs, title=f"PSD after HPA (baseline) IBO={ibo_db} dB")
-    plot_psd(y_cf, fs_hz=fs, title=f"PSD after HPA (clip+filter) IBO={ibo_db} dB")
+    y_cf = None
+    if cf_enabled:
+        tx_cf_ibo = set_average_power(tx_cf, target_pin)
+        y_cf = hpa(tx_cf_ibo)
 
-    # Spectrogram after HPA (baseline)
+    # PSD / Spectrogram after HPA
+    plot_psd(y_base, fs_hz=fs, title=f"PSD after HPA (baseline) IBO={ibo_db:.1f} dB")
+    if cf_enabled:
+        plot_psd(y_cf, fs_hz=fs, title=f"PSD after HPA (clip+filter) IBO={ibo_db:.1f} dB")
+
     plot_spectrogram(
-        y_base, fs=fs, title=f"Spectrogram after HPA (baseline) - IBO={ibo_db} dB"
+        y_base, fs=fs, title=f"Spectrogram after HPA (baseline) - IBO={ibo_db:.1f} dB"
     )
 
-    # ----- EVM + RX constellation after HPA -----
-    _, data_hat_base, _ = ofdm_demodulate_frame(
-        y_base, num_symbols=num_symbols, os_factor=os_factor, has_cp=True
+    # ---------------- Receiver: EVM + constellation ----------------
+    ref_syms = data_syms.reshape(-1)
+
+    est_base_c, evm_base, data_hat_base = rx_constellation_and_evm(
+        y_base,
+        ref_data_symbols=ref_syms,
+        num_symbols=num_symbols,
+        os_factor=os_factor,
+        do_iq_demod=False,  # set True only after you enable RF chain
     )
-    _, data_hat_cf, _ = ofdm_demodulate_frame(
-        y_cf, num_symbols=num_symbols, os_factor=os_factor, has_cp=True
-    )
-
-    ref = data_syms.reshape(-1)
-    est_base = data_hat_base.reshape(-1)
-    est_cf = data_hat_cf.reshape(-1)
-
-    est_base_c = complex_gain_correct(ref, est_base)
-    est_cf_c = complex_gain_correct(ref, est_cf)
-
-    evm_base = evm_rms(ref, est_base_c)
-    evm_cf = evm_rms(ref, est_cf_c)
+    est_cf_c = evm_cf = data_hat_cf = None
+    if cf_enabled:
+        est_cf_c, evm_cf, data_hat_cf = rx_constellation_and_evm(
+            y_cf,
+            ref_data_symbols=data_syms.reshape(-1),
+            num_symbols=num_symbols,
+            os_factor=os_factor,
+            do_iq_demod=False,
+        )
 
     plot_constellation(
-        est_base_c, title=f"RX constellation after HPA (baseline) - IBO={ibo_db} dB"
+        est_base_c, title=f"RX constellation after HPA (baseline) - IBO={ibo_db:.1f} dB"
     )
-    plot_constellation(
-        est_cf_c, title=f"RX constellation after HPA (clip+filter) - IBO={ibo_db} dB"
+    if cf_enabled:
+        plot_constellation(est_cf_c, title=f"RX constellation after HPA (clip+filter) - IBO={ibo_db:.1f} dB")
+    else:
+        print("Clip+filter disabled -> skipping CF RX constellation/EVM/BER.")
+
+    # ---------------- Full bit recovery + BER ----------------
+    rx_bits_base = rx_recover_bits(data_hat_base, modulation=modulation, rate=rate)
+    L = min(tx_bits.size, rx_bits_base.size)
+    ber_base = (
+        float(np.mean(rx_bits_base[:L] != tx_bits[:L])) if L > 0 else float("nan")
     )
 
+    ber_cf = None
+    if cf_enabled:
+        rx_bits_cf = rx_recover_bits(data_hat_cf, modulation=modulation, rate=rate)
+        L2 = min(tx_bits.size, rx_bits_cf.size)
+        ber_cf = float(np.mean(rx_bits_cf[:L2] != tx_bits[:L2])) if L2 > 0 else float("nan")
+
+    # ---------------- Print summary ----------------
     print("\n--- Results ---")
     print(
         f"Modulation: {modulation}, Rate: {rate}, Symbols: {num_symbols}, OS: {os_factor}x"
     )
-    print(
-        f"Mean PAPR baseline: {paprs.mean():.2f} dB, 99.9%: {np.quantile(paprs, 0.999):.2f} dB"
-    )
-    print(
-        f"Mean PAPR clip+filter: {paprs_cf.mean():.2f} dB, 99.9%: {np.quantile(paprs_cf, 0.999):.2f} dB"
-    )
     print(f"EVM after HPA (baseline, CPE-corrected): {evm_base * 100:.2f}%")
-    print(f"EVM after HPA (clip+filter, CPE-corrected): {evm_cf * 100:.2f}%")
+    print(f"BER after HPA (baseline): {ber_base:.6e}")
+    if cf_enabled:
+        print(f"EVM after HPA (clip+filter): {evm_cf*100:.2f}%")
+        print(f"BER after HPA (clip+filter): {ber_cf:.6e}")
 
-    # Save all figures
+    if use_mp3: 
+        rb = rx_bits_base[:orig_bit_len]
+        rec_base = bits_to_bytes(rb)[:orig_byte_len]
+        out_base = results_dir / f"{tag}_recovered_baseline.mp3"
+        out_base.write_bytes(rec_base)
+        
+        print(f"Saved recovered MP3 (baseline): {out_base}")
+        if cf_enabled:
+            rc = rx_bits_cf[:orig_bit_len]
+            rec_cf = bits_to_bytes(rc)[:orig_byte_len]
+            out_cf = results_dir / f"{tag}_recovered_clipfilter.mp3"
+            out_cf.write_bytes(rec_cf)
+            print(f"Saved recovered MP3 (clip+filter): {out_cf}")
+
+    # ---------------- Save all figures ----------------
     for fig_num in plt.get_fignums():
         fig = plt.figure(fig_num)
         fig.savefig(

@@ -18,50 +18,13 @@ class RappHPA:
     p: float = 2.0
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
+        x_in = np.asarray(x)
         x = np.asarray(x, dtype=np.complex128)
         r = np.abs(x)
         denom = (1.0 + (r / self.A_sat)**(2*self.p))**(1.0/(2*self.p))
-        # avoid division by 0
         denom = np.where(denom == 0, 1.0, denom)
-        return x / denom
-
-def set_average_power(x: np.ndarray, target_power: float = 1.0) -> np.ndarray:
-    x = np.asarray(x, dtype=np.complex128)
-    p = np.mean(np.abs(x)**2)
-    if p == 0:
-        return x.copy()
-    return x * np.sqrt(target_power / p)
-
-def evm_rms(ref: np.ndarray, est: np.ndarray) -> float:
-    """
-    RMS EVM: sqrt(E|e|^2 / E|ref|^2)
-    """
-    ref = np.asarray(ref, dtype=np.complex128).reshape(-1)
-    est = np.asarray(est, dtype=np.complex128).reshape(-1)
-    e = est - ref
-    num = np.mean(np.abs(e)**2)
-    den = np.mean(np.abs(ref)**2)
-    if den == 0:
-        return float("nan")
-    return float(np.sqrt(num / den))
-
-def cpe_correct(ref: np.ndarray, est: np.ndarray) -> np.ndarray:
-    """
-    Optional: correct a single common phase error by rotating est to best match ref.
-    """
-    ref = np.asarray(ref, dtype=np.complex128).reshape(-1)
-    est = np.asarray(est, dtype=np.complex128).reshape(-1)
-    # minimize ||ref - est*exp(jphi)|| => phi = angle(sum(ref*conj(est)))
-    phi = np.angle(np.sum(ref * np.conj(est)))
-    return est * np.exp(1j*phi)
-
-
-def complex_gain_correct(ref: np.ndarray, est: np.ndarray) -> np.ndarray:
-    """
-    Find complex scalar g minimizing ||ref - g*est||^2
-    Then return g*est (aligns both amplitude and phase).
-    """
-    ref = ref.reshape(-1)
-    est = est.reshape(-1)
-    g = np.vdot(est, ref) / np.vdot(est, est)
-    return g * est
+        y = x / denom
+        # If original input was real, return real output
+        if np.isrealobj(x_in):
+            return np.real(y).astype(np.float64)
+        return y

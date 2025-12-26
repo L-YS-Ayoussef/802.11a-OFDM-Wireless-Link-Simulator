@@ -113,3 +113,46 @@ def slicer(symbols: np.ndarray, modulation: str) -> np.ndarray:
     I_hat = levels_scaled[np.argmin(np.abs(I[:, None] - levels_scaled[None, :]), axis=1)]
     Q_hat = levels_scaled[np.argmin(np.abs(Q[:, None] - levels_scaled[None, :]), axis=1)]
     return (I_hat + 1j*Q_hat).astype(np.complex128)
+
+def symbols_to_bits_hard(symbols: np.ndarray, modulation: str) -> np.ndarray:
+    """
+    Hard demap symbols -> bits by nearest constellation decision (Gray).
+    Returns uint8 bits (0/1).
+    """
+    syms = np.asarray(symbols, dtype=np.complex128).reshape(-1)
+
+    # Use your slicer() as a decision device
+    decided = slicer(syms, modulation) / KMOD[modulation]  # normalize to raw levels
+
+    if modulation == "BPSK":
+        b = (np.real(decided) > 0).astype(np.uint8)
+        return b
+
+    if modulation == "QPSK":
+        I = (np.real(decided) > 0).astype(np.uint8)
+        Q = (np.imag(decided) > 0).astype(np.uint8)
+        return np.column_stack([I, Q]).reshape(-1).astype(np.uint8)
+
+    # QAM: decide to nearest odd integer levels, then convert to Gray bits.
+    nbpsc = NBPSC[modulation]
+    m = nbpsc // 2
+    M = 2**m
+    levels = np.arange(-(M - 1), M, 2)  # odd ints
+
+    I = np.real(decided)
+    Q = np.imag(decided)
+
+    I_idx = np.argmin(np.abs(I[:, None] - levels[None, :]), axis=1)
+    Q_idx = np.argmin(np.abs(Q[:, None] - levels[None, :]), axis=1)
+
+    # idx -> Gray code -> bits
+    def idx_to_gray_bits(idx: np.ndarray, m: int) -> np.ndarray:
+        gray = idx ^ (idx >> 1)
+        out = np.zeros((idx.size, m), dtype=np.uint8)
+        for b in range(m):
+            out[:, m - 1 - b] = (gray >> b) & 1
+        return out
+
+    Ib = idx_to_gray_bits(I_idx, m)
+    Qb = idx_to_gray_bits(Q_idx, m)
+    return np.hstack([Ib, Qb]).reshape(-1).astype(np.uint8)
