@@ -54,3 +54,14 @@ def cpe_correct(ref: np.ndarray, est: np.ndarray) -> np.ndarray:
     # minimize ||ref - est*exp(jphi)|| => phi = angle(sum(ref*conj(est)))
     phi = np.angle(np.sum(ref * np.conj(est)))
     return est * np.exp(1j*phi)
+
+
+def complex_gain_correct(ref: np.ndarray, est: np.ndarray) -> np.ndarray:
+    """
+    Find complex scalar g minimizing ||ref - g*est||^2
+    Then return g*est (aligns both amplitude and phase).
+    """
+    ref = ref.reshape(-1)
+    est = est.reshape(-1)
+    g = np.vdot(est, ref) / np.vdot(est, est)
+    return g * est
