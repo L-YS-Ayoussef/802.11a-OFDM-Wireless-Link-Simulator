@@ -3,43 +3,12 @@ from __future__ import annotations
 import numpy as np
 from src.ofdm import ofdm_demodulate_frame
 from src.rf import iq_demodulate
-from src.utils import complex_gain_correct, evm_rms  
+from src.utils import complex_gain_correct, evm_rms, add_awgn
 from src.mapping import symbols_to_bits_hard
 from src.interleaver import deinterleave_symbol
 from src.fec_decode import fec_decode
+from src.equalizer import equalize_frame_from_pilots
 
-def rx_constellation_and_evm(
-    rx_in: np.ndarray,
-    ref_data_symbols: np.ndarray,
-    num_symbols: int,
-    os_factor: int,
-    do_iq_demod: bool = False,
-    fs: float | None = None,
-    fc: float | None = None,
-    lpf_cutoff_hz: float | None = None,
-):
-    """
-    Returns:
-      est_c: complex equalized constellation points (flattened)
-      evm: RMS EVM (0..1)
-      data_hat: (num_symbols,48) raw demod data subcarriers
-    """
-    y = rx_in
-    if do_iq_demod:
-        if fs is None or fc is None or lpf_cutoff_hz is None:
-            raise ValueError("fs, fc, lpf_cutoff_hz required when do_iq_demod=True")
-        y = iq_demodulate(y, fs=fs, fc=fc, lpf_cutoff_hz=lpf_cutoff_hz)
-
-    _, data_hat, _ = ofdm_demodulate_frame(
-        y, num_symbols=num_symbols, os_factor=os_factor, has_cp=True
-    )
-
-    ref = np.asarray(ref_data_symbols, dtype=np.complex128).reshape(-1)
-    est = data_hat.reshape(-1)
-
-    est_c = complex_gain_correct(ref, est)  # your existing correction
-    evm = evm_rms(ref, est_c)
-    return est_c, evm, data_hat
 
 def rx_recover_bits(
     data_hat: np.ndarray,  # (num_symbols,48) complex
@@ -69,3 +38,56 @@ def rx_recover_bits(
     # FEC decode (Viterbi) to recover info bits
     info = fec_decode(coded, rate=rate, add_tail=True)
     return info
+
+
+def rx_one_snr_equalized(
+    rx_clean: np.ndarray,
+    ref_data_symbols: np.ndarray,  # flattened reference data constellation points
+    tx_bits: np.ndarray,
+    modulation: str,
+    rate: str,
+    num_symbols: int,
+    os_factor: int,
+    snr_db: float,
+    eq_method: str,  # "zf" or "mmse"
+    rng: np.random.Generator,
+):
+    """
+    rx_clean -> AWGN -> OFDM demod -> equalize (ZF/MMSE) -> gain correct -> EVM
+            -> demap/deint/FEC decode -> BER
+
+    Returns:
+      ber: float
+      rx_bits: np.ndarray (decoded info bits)
+      est_c: np.ndarray complex constellation points after EQ + gain correction (flattened)
+      evm: float (0..1)
+    """
+    # Add noise
+    rx_noisy, noise_var = add_awgn(rx_clean, snr_db=float(snr_db), rng=rng)
+
+    # OFDM demod
+    _, data_hat, pilot_hat = ofdm_demodulate_frame(
+        rx_noisy, num_symbols=num_symbols, os_factor=os_factor, has_cp=True
+    )
+
+    # Equalize
+    nv = noise_var if eq_method.lower() == "mmse" else None
+    data_eq, _, _ = equalize_frame_from_pilots(
+        data_hat=data_hat, pilot_hat=pilot_hat, method=eq_method, noise_var=nv
+    )
+
+    # Constellation alignment + EVM (after equalizer)
+    ref = np.asarray(ref_data_symbols, dtype=np.complex128).reshape(-1)
+    est = data_eq.reshape(-1)
+    est_c = complex_gain_correct(ref, est)
+    evm = evm_rms(ref, est_c)
+
+    # Recover bits
+    rx_bits = rx_recover_bits(data_eq, modulation=modulation, rate=rate)
+
+    # BER
+    tx_bits = np.asarray(tx_bits, dtype=np.uint8).reshape(-1)
+    L = min(tx_bits.size, rx_bits.size)
+    ber = float(np.mean(rx_bits[:L] != tx_bits[:L])) if L > 0 else float("nan")
+
+    return ber, rx_bits, est_c, evm

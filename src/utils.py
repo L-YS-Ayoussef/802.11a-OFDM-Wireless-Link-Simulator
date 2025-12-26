@@ -175,3 +175,16 @@ def write_wav_from_pcm_bytes(
         w.setsampwidth(sampwidth)
         w.setframerate(fs)
         w.writeframes(pcm_bytes)
+
+
+def add_awgn(x: np.ndarray, snr_db: float, rng=None):
+    x = np.asarray(x, dtype=np.complex128)
+    if rng is None:
+        rng = np.random.default_rng(0)
+    ps = np.mean(np.abs(x) ** 2)
+    snr_lin = 10 ** (snr_db / 10)
+    noise_var = ps / snr_lin  # E|n|^2
+    n = np.sqrt(noise_var / 2) * (
+        rng.standard_normal(x.shape) + 1j * rng.standard_normal(x.shape)
+    )
+    return x + n, noise_var
