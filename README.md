@@ -160,7 +160,7 @@ This section shows test cases for two modulation techniques (**BPSK** and **QPSK
 - **Figures**
 - **TX**
 | Constellation (TX) | Spectogram (TX) | PAPR CCDF | PSD (TX, Baseline) | PSD (TX, Clip+Filter) | 
-|---|---|---|---|---|
+| ------------------ | --------------- | --------- | ------------------ | --------------------- |
 | ![fig1](tests/BPSK_tc1/fig1.png) |  ![fig2](tests/BPSK_tc1/fig2.png) | ![fig3](tests/BPSK_tc1/fig3.png) | ![fig4](tests/BPSK_tc1/fig4.png) | ![fig5](tests/BPSK_tc1/fig5.png) | 
 
 - **RX**
