@@ -193,6 +193,7 @@ This section shows test cases for two modulation techniques (**BPSK** and **QPSK
   - EVM(MMSE): **36.7%**
 
 - **Figures**
+
 | Constellation (TX) | Spectogram (TX) | PAPR CCDF | PSD (TX, Baseline) | PSD (TX, Clip+Filter) | Constellation (RX, Baseline, ZF) | Constellation (RX, Baseline, MMSE) | Constellation (RX, Clip+Filter, ZF) | (RX, Clip+Filter, MMSE) | BER Vs. SNR |
 |---|---|---|---|---|---|---|---|---|---|
 | ![fig1](tests/BPSK_tc2/fig1.png) |  ![fig2](tests/BPSK_tc2/fig2.png) | ![fig3](tests/BPSK_tc2/fig3.png) | ![fig4](tests/BPSK_tc2/fig4.png) | ![fig5](tests/BPSK_tc2/fig5.png) | ![fig6](tests/BPSK_tc2/fig6.png) | ![fig7](tests/BPSK_tc2/fig7.png) | ![fig8](tests/BPSK_tc2/fig8.png) | ![fig9](tests/BPSK_tc2/fig9.png) | ![fig10](tests/BPSK_tc2/fig10.png) |
@@ -228,6 +229,7 @@ This section shows test cases for two modulation techniques (**BPSK** and **QPSK
   - EVM(MMSE): **13.45%**
 
 - **Figures**
+
 | Constellation (TX) | Spectogram (TX) | PAPR CCDF | PSD (TX, Baseline) | PSD (TX, Clip+Filter) | Constellation (RX, Baseline, ZF) | Constellation (RX, Baseline, MMSE) | Constellation (RX, Clip+Filter, ZF) | (RX, Clip+Filter, MMSE) | BER Vs. SNR |
 |---|---|---|---|---|---|---|---|---|---|
 | ![fig1](tests/QPSK_tc1/fig1.png) |  ![fig2](tests/QPSK_tc1/fig2.png) | ![fig3](tests/QPSK_tc1/fig3.png) | ![fig4](tests/QPSK_tc1/fig4.png) | ![fig5](tests/QPSK_tc1/fig5.png) | ![fig6](tests/QPSK_tc1/fig6.png) | ![fig7](tests/QPSK_tc1/fig7.png) | ![fig8](tests/QPSK_tc1/fig8.png) | ![fig9](tests/QPSK_tc1/fig9.png) | ![fig10](tests/QPSK_tc1/fig10.png) |
@@ -263,6 +265,7 @@ This section shows test cases for two modulation techniques (**BPSK** and **QPSK
   - EVM(MMSE): **36.18%**
 
 - **Figures**
+
 | Constellation (TX) | Spectogram (TX) | PAPR CCDF | PSD (TX, Baseline) | PSD (TX, Clip+Filter) | Constellation (RX, Baseline, ZF) | Constellation (RX, Baseline, MMSE) | Constellation (RX, Clip+Filter, ZF) | (RX, Clip+Filter, MMSE) | BER Vs. SNR |
 |---|---|---|---|---|---|---|---|---|---|
 | ![fig1](tests/QPSK_tc2/fig1.png) |  ![fig2](tests/QPSK_tc2/fig2.png) | ![fig3](tests/QPSK_tc2/fig3.png) | ![fig4](tests/QPSK_tc2/fig4.png) | ![fig5](tests/QPSK_tc2/fig5.png) | ![fig6](tests/QPSK_tc2/fig6.png) | ![fig7](tests/QPSK_tc2/fig7.png) | ![fig8](tests/QPSK_tc2/fig8.png) | ![fig9](tests/QPSK_tc2/fig9.png) | ![fig10](tests/QPSK_tc2/fig10.png) |
