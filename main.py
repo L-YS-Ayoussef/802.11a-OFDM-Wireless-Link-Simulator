@@ -27,16 +27,15 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from src import params
-from src.coding import ndbps_per_symbol
-from src.mapping import NBPSC
-from src.hpa import RappHPA
-from src.transmitter import TxConfig, build_tx_waveforms
-from src.channel import FIRChannel, DEFAULT_H
-from src.receiver import rx_one_snr_equalized
-from src.equalizer import equalize_frame_from_pilots
+from src.phy import params
+from src.phy.coding import ndbps_per_symbol
+from src.phy.mapping import NBPSC
+from src.rf.hpa import RappHPA
+from src.chains.transmitter import TxConfig, build_tx_waveforms
+from src.rf.channel import FIRChannel, DEFAULT_H
+from src.chains.receiver import rx_one_snr_equalized
 
-from src.utils import (
+from src.metrics.utils import (
     set_average_power,
     bits_to_bytes,
     plot_constellation,
@@ -46,8 +45,8 @@ from src.utils import (
     add_awgn,
 )
 
-# Optional RF chain (not enabled by default)
-from src.rf import iq_modulate, iq_demodulate
+# RF chain (not enabled by default)
+from src.rf.rf import iq_modulate, iq_demodulate
 
 
 def _ask_choice(prompt: str, options: list[str]) -> str:
@@ -151,8 +150,11 @@ def main():
     num_symbols = _ask_int("Number of OFDM data symbols (e.g., 50)", 200)
     os_factor = _ask_int("Oversampling factor for PAPR/PSD (1,2,4)", 4)
 
-    clip_ratio = _ask_float("Clipping ratio (A/RMS)", 1.2)
     clip_iters = _ask_int("Clip+filter iterations", 2)
+    if clip_iters > 0:
+        clip_ratio = _ask_float("Clipping ratio (A/RMS)", 1.2)
+    else:
+        clip_ratio = None
 
     ibo_db = _ask_float("HPA Input Backoff (dB)", 6.0)
     rapp_p = _ask_float("Rapp smoothness p", 2.0)
@@ -165,7 +167,7 @@ def main():
             mp3_path = "test.mp3"
 
     # Results directory
-    results_dir = Path("results")
+    results_dir = Path("tests/BPSK_tc2")
     results_dir.mkdir(parents=True, exist_ok=True)
 
     tag = f"{modulation}_{rate.replace('/','-')}_N{num_symbols}_OS{os_factor}"
@@ -266,58 +268,32 @@ def main():
             y_cf, fs_hz=fs, title=f"PSD after HPA (clip+filter) IBO={ibo_db:.1f} dB"
         )
 
-    # ---------------- Time-invariant complex FIR filter wireless channel ----------------
-    chan = FIRChannel(h=DEFAULT_H, normalize=True)
-    r_base = chan(y_base)
-    r_cf = chan(y_cf) if cf_enabled else None
+    if modulation in ("16QAM", "64QAM"):
+        pass
+    else:
+        # ---------------- Time-invariant complex FIR filter wireless channel ----------------
+        chan = FIRChannel(h=DEFAULT_H, normalize=True)
+        r_base = chan(y_base)
+        r_cf = chan(y_cf) if cf_enabled else None
 
-    # ---------------- SNR sweep: BER for ZF & MMSE ----------------
-    snr_dbs = np.linspace(0, 10, 10)
-    ber_base_zf = np.zeros_like(snr_dbs, dtype=float)
-    ber_base_mmse = np.zeros_like(snr_dbs, dtype=float)
-    ber_cf_zf = np.zeros_like(snr_dbs, dtype=float) if cf_enabled else None
-    ber_cf_mmse = np.zeros_like(snr_dbs, dtype=float) if cf_enabled else None
+        # ---------------- SNR sweep: BER for ZF & MMSE ----------------
+        snr_dbs = np.linspace(0, 10, 5)
+        ber_base_zf = np.zeros_like(snr_dbs, dtype=float)
+        ber_base_mmse = np.zeros_like(snr_dbs, dtype=float)
+        ber_cf_zf = np.zeros_like(snr_dbs, dtype=float) if cf_enabled else None
+        ber_cf_mmse = np.zeros_like(snr_dbs, dtype=float) if cf_enabled else None
 
-    rng = np.random.default_rng(123)
+        rng = np.random.default_rng(123)
 
-    ref_syms = data_syms.reshape(-1)  # reference constellation points
+        ref_syms = data_syms.reshape(-1)  # reference constellation points
 
-    for idx, snr_db in enumerate(snr_dbs):
-        is_last = idx == len(snr_dbs) - 1
+        for idx, snr_db in enumerate(snr_dbs):
+            print(idx)
+            is_last = idx == len(snr_dbs) - 1
 
-        # ----- Baseline -----
-        b_zf, rx_bits_base_zf, est_base_zf_c, evm_base_zf = rx_one_snr_equalized(
-            rx_clean=r_base,
-            ref_data_symbols=ref_syms,
-            tx_bits=tx_bits,
-            modulation=modulation,
-            rate=rate,
-            num_symbols=num_symbols,
-            os_factor=os_factor,
-            snr_db=snr_db,
-            eq_method="zf",
-            rng=rng,
-        )
-        b_mm, rx_bits_base_mm, est_base_mm_c, evm_base_mm = rx_one_snr_equalized(
-            rx_clean=r_base,
-            ref_data_symbols=ref_syms,
-            tx_bits=tx_bits,
-            modulation=modulation,
-            rate=rate,
-            num_symbols=num_symbols,
-            os_factor=os_factor,
-            snr_db=snr_db,
-            eq_method="mmse",
-            rng=rng,
-        )
-
-        ber_base_zf[idx] = b_zf
-        ber_base_mmse[idx] = b_mm
-
-        # ----- Clip+filter (optional) -----
-        if cf_enabled:
-            c_zf, rx_bits_cf_zf, est_cf_zf_c, evm_cf_zf = rx_one_snr_equalized(
-                rx_clean=r_cf,
+            # ----- Baseline -----
+            b_zf, rx_bits_base_zf, est_base_zf_c, evm_base_zf = rx_one_snr_equalized(
+                rx_clean=r_base,
                 ref_data_symbols=ref_syms,
                 tx_bits=tx_bits,
                 modulation=modulation,
@@ -328,8 +304,8 @@ def main():
                 eq_method="zf",
                 rng=rng,
             )
-            c_mm, rx_bits_cf_mm, est_cf_mm_c, evm_cf_mm = rx_one_snr_equalized(
-                rx_clean=r_cf,
+            b_mm, rx_bits_base_mm, est_base_mm_c, evm_base_mm = rx_one_snr_equalized(
+                rx_clean=r_base,
                 ref_data_symbols=ref_syms,
                 tx_bits=tx_bits,
                 modulation=modulation,
@@ -341,84 +317,114 @@ def main():
                 rng=rng,
             )
 
-            ber_cf_zf[idx] = c_zf
-            ber_cf_mmse[idx] = c_mm
+            ber_base_zf[idx] = b_zf
+            ber_base_mmse[idx] = b_mm
 
-        # ----- Only at final SNR: plots + audio + summary -----
-        if is_last:
-            plot_constellation(
-                est_base_zf_c,
-                title=f"EQ(MMSE) constellation (baseline) @ SNR={snr_db:.1f} dB",
-            )
-            plot_constellation(
-                est_base_mm_c,
-                title=f"EQ(MMSE) constellation (baseline) @ SNR={snr_db:.1f} dB",
-            )
+            # ----- Clip+filter -----
             if cf_enabled:
+                c_zf, rx_bits_cf_zf, est_cf_zf_c, evm_cf_zf = rx_one_snr_equalized(
+                    rx_clean=r_cf,
+                    ref_data_symbols=ref_syms,
+                    tx_bits=tx_bits,
+                    modulation=modulation,
+                    rate=rate,
+                    num_symbols=num_symbols,
+                    os_factor=os_factor,
+                    snr_db=snr_db,
+                    eq_method="zf",
+                    rng=rng,
+                )
+                c_mm, rx_bits_cf_mm, est_cf_mm_c, evm_cf_mm = rx_one_snr_equalized(
+                    rx_clean=r_cf,
+                    ref_data_symbols=ref_syms,
+                    tx_bits=tx_bits,
+                    modulation=modulation,
+                    rate=rate,
+                    num_symbols=num_symbols,
+                    os_factor=os_factor,
+                    snr_db=snr_db,
+                    eq_method="mmse",
+                    rng=rng,
+                )
+
+                ber_cf_zf[idx] = c_zf
+                ber_cf_mmse[idx] = c_mm
+
+            # ----- Only at final SNR: plots + audio + summary -----
+            if is_last:
                 plot_constellation(
-                    est_cf_zf_c,
-                    title=f"EQ(MMSE) constellation (clip+filter) @ SNR={snr_db:.1f} dB",
+                    est_base_zf_c,
+                    title=f"EQ(zf) constellation (baseline) @ SNR={snr_db:.1f} dB",
                 )
                 plot_constellation(
-                    est_cf_mm_c,
-                    title=f"EQ(MMSE) constellation (clip+filter) @ SNR={snr_db:.1f} dB",
+                    est_base_mm_c,
+                    title=f"EQ(MMSE) constellation (baseline) @ SNR={snr_db:.1f} dB",
                 )
-            else:
+                if cf_enabled:
+                    plot_constellation(
+                        est_cf_zf_c,
+                        title=f"EQ(zf) constellation (clip+filter) @ SNR={snr_db:.1f} dB",
+                    )
+                    plot_constellation(
+                        est_cf_mm_c,
+                        title=f"EQ(MMSE) constellation (clip+filter) @ SNR={snr_db:.1f} dB",
+                    )
+                else:
+                    print(
+                        "Clip+filter disabled -> skipping CF constellation/audio/summary."
+                    )
+
+                print("\n--- Results (final SNR only) ---")
                 print(
-                    "Clip+filter disabled -> skipping CF constellation/audio/summary."
+                    f"Modulation: {modulation}, Rate: {rate}, Symbols: {num_symbols}, OS: {os_factor}x"
                 )
+                print(f"Final SNR: {snr_db:.1f} dB")
 
-            print("\n--- Results (final SNR only) ---")
-            print(
-                f"Modulation: {modulation}, Rate: {rate}, Symbols: {num_symbols}, OS: {os_factor}x"
-            )
-            print(f"Final SNR: {snr_db:.1f} dB")
-
-            print(f"Baseline:  BER(ZF)={b_zf:.6e},  BER(MMSE)={b_mm:.6e}")
-            print(
-                f"Baseline:  EVM(ZF)={evm_base_zf*100:.2f}%,  EVM(MMSE)={evm_base_mm*100:.2f}%"
-            )
-
-            if cf_enabled:
-                print(f"ClipFilt:  BER(ZF)={c_zf:.6e},  BER(MMSE)={c_mm:.6e}")
+                print(f"Baseline:  BER(ZF)={b_zf:.6e},  BER(MMSE)={b_mm:.6e}")
                 print(
-                    f"ClipFilt:  EVM(ZF)={evm_cf_zf*100:.2f}%,  EVM(MMSE)={evm_cf_mm*100:.2f}%"
+                    f"Baseline:  EVM(ZF)={evm_base_zf*100:.2f}%,  EVM(MMSE)={evm_base_mm*100:.2f}%"
                 )
-
-            # Save recovered MP3 only for final SNR (use MMSE bits)
-            if use_mp3:
-                # baseline MMSE
-                rb = rx_bits_base_mm[:orig_bit_len]
-                rec_base = bits_to_bytes(rb)[:orig_byte_len]
-                out_base = (
-                    results_dir / f"{tag}_recovered_baseline_SNR{snr_db:.1f}dB_mmse.mp3"
-                )
-                out_base.write_bytes(rec_base)
-                print(f"Saved recovered MP3 (baseline, MMSE): {out_base}")
 
                 if cf_enabled:
-                    rc = rx_bits_cf_mm[:orig_bit_len]
-                    rec_cf = bits_to_bytes(rc)[:orig_byte_len]
-                    out_cf = (
-                        results_dir
-                        / f"{tag}_recovered_clipfilter_SNR{snr_db:.1f}dB_mmse.mp3"
+                    print(f"ClipFilt:  BER(ZF)={c_zf:.6e},  BER(MMSE)={c_mm:.6e}")
+                    print(
+                        f"ClipFilt:  EVM(ZF)={evm_cf_zf*100:.2f}%,  EVM(MMSE)={evm_cf_mm*100:.2f}%"
                     )
-                    out_cf.write_bytes(rec_cf)
-                    print(f"Saved recovered MP3 (clip+filter, MMSE): {out_cf}")
-    
-    plt.figure()
-    plt.semilogy(snr_dbs, ber_base_zf, marker="o", label="Baseline ZF")
-    plt.semilogy(snr_dbs, ber_base_mmse, marker="o", label="Baseline MMSE")
 
-    if cf_enabled:
-        plt.semilogy(snr_dbs, ber_cf_zf, marker="s", label="Clip+Filter ZF")
-        plt.semilogy(snr_dbs, ber_cf_mmse, marker="s", label="Clip+Filter MMSE")
+                # Save recovered MP3 only for final SNR (use MMSE bits)
+                if use_mp3:
+                    # baseline MMSE
+                    rb = rx_bits_base_mm[:orig_bit_len]
+                    rec_base = bits_to_bytes(rb)[:orig_byte_len]
+                    out_base = (
+                        results_dir / f"{tag}_recovered_baseline_SNR{snr_db:.1f}dB_mmse.mp3"
+                    )
+                    out_base.write_bytes(rec_base)
+                    print(f"Saved recovered MP3 (baseline, MMSE): {out_base}")
 
-    plt.grid(True, which="both")
-    plt.xlabel("SNR (dB)")
-    plt.ylabel("BER")
-    plt.title("BER vs SNR (ZF vs MMSE)")
-    plt.legend()
+                    if cf_enabled:
+                        rc = rx_bits_cf_mm[:orig_bit_len]
+                        rec_cf = bits_to_bytes(rc)[:orig_byte_len]
+                        out_cf = (
+                            results_dir
+                            / f"{tag}_recovered_clipfilter_SNR{snr_db:.1f}dB_mmse.mp3"
+                        )
+                        out_cf.write_bytes(rec_cf)
+                        print(f"Saved recovered MP3 (clip+filter, MMSE): {out_cf}")
+
+        plt.figure()
+        plt.semilogy(snr_dbs, ber_base_zf, marker="o", label="Baseline ZF")
+        plt.semilogy(snr_dbs, ber_base_mmse, marker="o", label="Baseline MMSE")
+
+        if cf_enabled:
+            plt.semilogy(snr_dbs, ber_cf_zf, marker="s", label="Clip+Filter ZF")
+            plt.semilogy(snr_dbs, ber_cf_mmse, marker="s", label="Clip+Filter MMSE")
+
+        plt.grid(True, which="both")
+        plt.xlabel("SNR (dB)")
+        plt.ylabel("BER")
+        plt.title("BER vs SNR (ZF vs MMSE)")
+        plt.legend()
 
     # ---------------- Save all figures ----------------
     for fig_num in plt.get_fignums():
